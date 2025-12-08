@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Global Climate Analytics</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        : root {
+            --bg: #101010; 
+            --tooltip-bg: rgba(20, 20, 20, 0.98); /* Less transparent for readability */
+            --text: #e0e0e0;
+            --accent: #00d2ff;
+            --danger: #ff4b4b;
+            --hdi: #f9d423;
+        }
+
+        body {
+            margin: 0; padding: 0;
+            background: var(--bg); color: var(--text);
+            font-family: 'Segoe UI', Roboto, sans-serif;
+            overflow: hidden; width: 100vw; height: 100vh;
+        }
+
+        /* MAP LAYER */
+        #map-container {
+            width: 100vw; height: 100vh;
+            position: absolute; top: 0; left: 0; z-index: 1;
+        }
+
+        /* OZONE WIDGET (Bottom Right) */
+        #ozone-widget {
+            position: absolute; bottom: 30px; right: 30px;
+            width: 320px; height: 200px;
+            background: var(--tooltip-bg);
+            border: 1px solid #333; border-radius: 12px;
+            padding: 20px; z-index: 10;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.8);
+            backdrop-filter: blur(5px);
+        }
+
+        /* HOVER TOOLTIP */
+        #tooltip {
+            position: absolute; width: 320px;
+            background: var(--tooltip-bg);
+            border: 1px solid #555; border-radius: 8px;
+            padding: 20px; pointer-events: none; opacity: 0;
+            transition: opacity 0.1s ease; z-index: 100;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.9);
+            /* Safety constraints */
+            max-height: 95vh;
+            overflow: hidden; 
+        }
+
+        /* TEXT STYLES */
+        h1 { margin: 0 0 15px 0; font-size: 18px; color: #fff; font-weight: 700; border-bottom: 1px solid #333; padding-bottom: 10px; }
+        .chart-header { display: flex; justify-content: space-between; align-items: flex-end; margin-top: 12px; margin-bottom: 5px; }
+        .chart-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; }
+        .chart-unit { font-size: 10px; color: #888; font-style: italic; }
+
+        /* AXIS STYLES */
+        .axis text { fill: #666; font-size: 9px; font-family: monospace; }
+        .axis path, .axis line { stroke: #333; stroke-dasharray: 2; }
+        .domain { display: none; }
+
+        /* LOADER */
+        #loader {
+            position: fixed; inset: 0; background: #111; z-index: 9999;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+        }
+        .spinner {
+            width: 40px; height: 40px; border: 3px solid #333;
+            border-top: 3px solid var(--accent); border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin { 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+
+    <div id="loader">
+        <div class="spinner"></div>
+        <p style="color:#666; font-size: 12px; margin-top:15px;">PROCESSING 2010-2023 DATA...</p>
+    </div>
+
+    <div id="map-container"></div>
+    <div id="tooltip"></div>
+
+    <div id="ozone-widget">
+        <div class="chart-header" style="margin-top:0;">
+            <span class="chart-label" style="color:#aaa;">Global Stratosphere</span>
+            <span class="chart-unit">Dobson Units (DU)</span>
+        </div>
+        <h2 style="margin:0 0 10px 0; font-size:24px; color:#fff;">Ozone Layer</h2>
+        <div id="ozone-chart-area"></div>
+    </div>
+
+<script>
+//UTILITIES
+function getVal(row, possibleNames) {
+    for (let name of possibleNames) {
+        if (row[name] !== undefined) return row[name];
+    }
+    return null;
+}
+
+//STATE
+let mapData, co2Data, hdiData, tempData, ozoneData;
+let groupedCO2, groupedHDI;
+let globalTempData = [], globalOzoneData = [];
+
+//INIT
+async function init() {
+    try {
+        const loadFiles = [
+            d3.json("https://raw.githubusercontent.com/holtzy/D3-graph-gallery/master/DATA/world.geojson"),
+            d3.csv("co-emissions-per-capita.csv"), 
+            d3.csv("human-development-index.csv"),   
+            d3.csv("monthly-temperature-anomalies.csv"), 
+            d3.csv("stratospheric-ozone-concentration.csv") 
+        ];
+
+        [mapData, co2Data, hdiData, tempData, ozoneData] = await Promise.all(loadFiles);
+        globalTempData = calculateGlobalAverage(tempData, ["temperature_anomaly", "anomaly"]);
+        globalOzoneData = calculateGlobalAverage(ozoneData, ["stratospheric_ozone_concentration", "ozone", "conc"]);
+
+        processData();
+        initMap();
+        initOzoneWidget();
+        
+        d3.select("#loader").style("display", "none");
+
+    } catch (error) {
+        console.error(error);
+        alert("Error: Check console (F12) for details.");
+    }
+}
+
+function calculateGlobalAverage(dataset, valueKeywords) {
+    const valCol = dataset.columns.find(c => valueKeywords.some(k => c.toLowerCase().includes(k)));
+    if(!valCol) {
+        console.warn("Could not find value column for", valueKeywords);
+        return [];
+    }
+
+    //Map-rows
+    const mapped = dataset.map(d => {
+        let y = getVal(d, ["Year", "year"]);
+        if (!y) {
+            const dateStr = getVal(d, ["Day", "day"]);
+            if (dateStr && dateStr.length >= 4) {
+                y = parseInt(dateStr.substring(0, 4)); // Grab first 4 chars as year
+            }
+        }
+        return { year: +y, val: +d[valCol] };
+    }).filter(d => d.year >= 2010 && d.year <= 2023 && !isNaN(d.val));
+    const grouped = d3.rollup(mapped, v => d3.mean(v, d => d.val), d => d.year);
+    return Array.from(grouped, ([year, val]) => ({year, val})).sort((a,b) => a.year - b.year);
+}
+
+function processData() {
+    groupedCO2 = d3.group(co2Data, d => d.Code || d.Entity);
+    groupedHDI = d3.group(hdiData, d => d.Code || d.Entity);
+}
+
+// MAP
+function initMap() {
+    const container = document.getElementById("map-container");
+    const w = container.clientWidth, h = container.clientHeight;
+
+    const svg = d3.select("#map-container").append("svg").attr("width", w).attr("height", h);
+    const projection = d3.geoMercator().fitSize([w, h], mapData);
+    const path = d3.geoPath().projection(projection);
+    
+    // Color
+    const valCol = co2Data.columns.find(c => c.toLowerCase().includes("emission"));
+    const colorScale = d3.scaleSequential(d3.interpolateViridis).domain([0, 15]); 
+
+    svg.append("g").selectAll("path")
+        .data(mapData.features)
+        .enter().append("path")
+        .attr("d", path)
+        .attr("fill", d => {
+            const iso = d.id; 
+            const record = groupedCO2.get(iso);
+            if (record && valCol) {
+                const valid = record.filter(r => r[valCol]);
+                if(valid.length) return colorScale(+valid[valid.length-1][valCol]);
+            }
+            return "#1a1a1a";
+        })
+        .attr("stroke", "#000").attr("stroke-width", 0.5)
+        .style("cursor", "crosshair")
+        .on("mouseover", function(e, d) {
+            d3.select(this).attr("stroke", "#fff").attr("stroke-width", 2);
+            updateTooltip(d);
+        })
+        .on("mousemove", (e) => moveTooltip(e))
+        .on("mouseout", function() {
+            d3.select(this).attr("stroke", "#000").attr("stroke-width", 0.5);
+            d3.select("#tooltip").style("opacity", 0);
+        });
+}
+
+//TOOLTIP
+function updateTooltip(d) {
+    const tooltip = d3.select("#tooltip");
+    const iso = d.id;
+    const name = d.properties.name;
+    const co2Col = co2Data.columns.find(c => c.toLowerCase().includes("emission"));
+    const hdiCol = hdiData.columns.find(c => c.toLowerCase().includes("human") || c.toLowerCase().includes("hdi"));
+    const cleanRows = (rows, colName) => {
+        if(!rows || !colName) return [];
+        return rows.map(r => ({
+            year: +(r.Year || r.year),
+            val: +r[colName]
+        })).filter(r => r.year >= 2010 && r.year <= 2023 && !isNaN(r.val)).sort((a,b) => a.year - b.year);
+    };
+
+    const co2 = cleanRows(groupedCO2.get(iso), co2Col);
+    const hdi = cleanRows(groupedHDI.get(iso), hdiCol);
+
+    tooltip.html("");
+    tooltip.append("h1").text(name);
+
+    const W = 280, H = 70; 
+
+    // CO2
+    const h1 = tooltip.append("div").attr("class", "chart-header");
+    h1.append("span").attr("class", "chart-label").style("color", "#ff4b4b").text("CO2 Emissions");
+    h1.append("span").attr("class", "chart-unit").text("Tonnes/Capita");
+    drawChart(tooltip, co2, W, H, "#ff4b4b", "co2");
+
+    // HDI
+    const h2 = tooltip.append("div").attr("class", "chart-header");
+    h2.append("span").attr("class", "chart-label").style("color", "#f9d423").text("Human Development");
+    h2.append("span").attr("class", "chart-unit").text("Index (0-1)");
+    drawChart(tooltip, hdi, W, H, "#f9d423", "hdi");
+}
+
+function drawChart(container, data, w, h, color, id) {
+    if(!data || !data.length) {
+        container.append("div").style("height", h+"px").style("display","flex").style("align-items","center").style("justify-content","center").text("No Data (2010-2023)").style("color","#555").style("font-size","10px");
+        return;
+    }
+
+    const m = {t: 5, r: 10, b: 20, l: 30};
+    const width = w - m.l - m.r;
+    const height = h - m.t - m.b;
+
+    const svg = container.append("svg").attr("width", w).attr("height", h)
+        .append("g").attr("transform", `translate(${m.l},${m.t})`);
+    
+    const x = d3.scaleLinear().domain([2010, 2023]).range([0, width]);
+    const y = d3.scaleLinear().domain(d3.extent(data, d => d.val)).range([height, 0]);
+
+    // Grid
+    svg.append("g").attr("class", "axis").style("opacity",0.1).call(d3.axisLeft(y).ticks(3).tickSize(-width).tickFormat(""));
+
+    // Axes
+    svg.append("g").attr("class", "axis").attr("transform", `translate(0,${height})`).call(d3.axisBottom(x).ticks(4).tickFormat(d3.format("d")));
+    svg.append("g").attr("class", "axis").call(d3.axisLeft(y).ticks(3));
+
+    // Gradient
+    const defs = svg.append("defs");
+    const gradId = "grad-" + id + "-" + Math.random().toString(36).substr(2, 9);
+    const gradient = defs.append("linearGradient").attr("id", gradId).attr("x1", "0%").attr("y1", "0%").attr("x2", "0%").attr("y2", "100%");
+    gradient.append("stop").attr("offset", "0%").style("stop-color", color).style("stop-opacity", 0.5);
+    gradient.append("stop").attr("offset", "100%").style("stop-color", color).style("stop-opacity", 0);
+
+    // Area & Line
+    const area = d3.area().curve(d3.curveMonotoneX).x(d => x(d.year)).y0(height).y1(d => y(d.val));
+    const line = d3.line().curve(d3.curveMonotoneX).x(d => x(d.year)).y(d => y(d.val));
+
+    // Animation Reveal
+    const clipId = "clip-" + gradId;
+    svg.append("defs").append("clipPath").attr("id", clipId).append("rect")
+        .attr("width", 0).attr("height", h).transition().duration(800).attr("width", w);
+    
+    svg.append("g").attr("clip-path", `url(#${clipId})`).append("path").datum(data).attr("fill", `url(#${gradId})`).attr("d", area);
+    svg.append("g").attr("clip-path", `url(#${clipId})`).append("path").datum(data).attr("fill", "none").attr("stroke", color).attr("stroke-width", 2).attr("d", line);
+
+    // End Dot
+    const last = data[data.length-1];
+    svg.append("circle").attr("cx", x(last.year)).attr("cy", y(last.val)).attr("r", 3).attr("fill", "#fff");
+}
+
+// POSITIONING
+function moveTooltip(event) {
+    const t = document.getElementById("tooltip");
+    if(!t) return;
+    
+    const w = t.offsetWidth;
+    const h = t.offsetHeight;
+    const padding = 20;
+    let left = event.pageX + padding;
+    if (left + w > window.innerWidth) {
+        left = event.pageX - w - padding;
+    }
+    if (top + h > window.innerHeight) {
+        top = event.pageY - h - padding; // Flip up
+    }
+    if (top < 0) {
+        top = 20; // Force it to always stay 20px from the top
+    }
+
+    t.style.left = left + "px";
+    t.style.top = top + "px";
+    t.style.opacity = 1;
+}
+
+//OZONE
+function initOzoneWidget() {
+    const container = d3.select("#ozone-chart-area");
+    drawChart(container, globalOzoneData, 280, 140, "#00d2ff", "ozone");
+}
+init();
+</script>
+</body>
+</html>
